@@ -8,28 +8,62 @@
 
 #define FUSE_USE_VERSION 26
 
-#include <stdio.h>
+#include <errno.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <fuse.h>
-#include <unistd.h>
-#include <errno.h>
-#include <stdbool.h>
-#include <time.h>
-#include <string.h>
-#include <stdlib.h>
 #include <libgen.h>
-#include <sched.h>
 #include <pthread.h>
-#include <dlfcn.h>
-#include <linux/sched.h>
-#include <sys/socket.h>
-#include <sys/mount.h>
-#include <sys/epoll.h>
+#include <sched.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
 #include <wait.h>
+#include <linux/sched.h>
+#include <sys/epoll.h>
+#include <sys/mount.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
 
 #include "config.h" // for VERSION
 #include "bindings.h"
+
+/* Define pivot_root() if missing from the C library */
+#ifndef HAVE_PIVOT_ROOT
+static int pivot_root(const char * new_root, const char * put_old)
+{
+#ifdef __NR_pivot_root
+return syscall(__NR_pivot_root, new_root, put_old);
+#else
+errno = ENOSYS;
+return -1;
+#endif
+}
+#else
+extern int pivot_root(const char * new_root, const char * put_old);
+#endif
+
+/*
+ * ns_fd[INIT_MNTNS]	--> initial       mnt ns
+ * ns_fd[LXCFS_MNTNS]	--> private lxcfs mnt ns
+ * active_ns		--> currently active mnt ns == one of ns_fd[MNT_NS_MAX]
+ */
+#define INIT_MNTNS 0
+#define LXCFS_MNTNS 1
+#define MNT_NS_MAX 2
+static struct preserved_ns {
+	int ns_fd[MNT_NS_MAX];
+	int active_ns;
+} preserved_ns = {
+    .ns_fd = {-1, -1},
+    .active_ns = -1,
+};
+
+// int preserved_ns[MNT_NS_MAX] = {-1, -1};
 
 void *dlopen_handle;
 
@@ -67,12 +101,81 @@ static void users_unlock(void)
 	unlock_mutex(&user_count_mutex);
 }
 
+/*
+ * Simple functions to preserve and switch mount namespaces.
+ */
+
+/* Close all open file descriptors refering to a namespace. */
+static void close_ns(struct preserved_ns *ns) {
+	int i;
+	for (i = 0; i < MNT_NS_MAX; i++) {
+		if (ns->ns_fd[i] > -1) {
+			close(ns->ns_fd[i]);
+			ns->ns_fd[i] = -1;
+		}
+	}
+	ns->active_ns = -1;
+}
+
+/* Open /proc/PID/ns/mnt and save open fd to preserve the mount namespace.
+ * if @is_caller_pid is set to true it is assumed that @pid is the callers pid
+ * and that we are attached to the namespace identified by which_ns.
+ */
+static bool preserve_ns(struct preserved_ns *ns, int which_ns, int pid, bool is_caller_pid)
+{
+	int ret;
+	size_t len = 5 /* /proc */ + 21 /* /int_as_str */ + 7 /* /ns/mnt */ + 1 /* \0 */;
+	char path[len];
+
+	ret = snprintf(path, len, "/proc/%d/ns/mnt", pid);
+	if (ret < 0 || (size_t)ret >= len)
+		return false;
+
+	ns->ns_fd[which_ns] = open(path, O_RDONLY | O_CLOEXEC);
+	if (ns->ns_fd[which_ns] < 0)
+		goto error;
+
+	if (is_caller_pid)
+		ns->active_ns = ns->ns_fd[which_ns];
+
+	return true;
+
+error:
+	close_ns(ns);
+	return false;
+}
+
+/* Switch caller to namespace identified by the fd retrieved via @which_ns and
+ * set the active namespace to the switched namespace. */
+static bool switch_ns(struct preserved_ns *ns, int which_ns) {
+	int ret = setns(ns->ns_fd[which_ns], 0);
+	if (ret < 0)
+		ns->active_ns = ns->ns_fd[which_ns] = ret;
+	else
+		ns->active_ns = ns->ns_fd[which_ns];
+
+	return ret == 0;
+}
+
+/*
+ * Functions and types used to reload dynamic library.
+ */
 static volatile sig_atomic_t need_reload;
 
 /* do_reload - reload the dynamic library.  Done under
  * lock and when we know the user_count was 0 */
-static void do_reload(void)
+static void do_reload(struct preserved_ns *ns)
 {
+	if (ns->active_ns != -1) {
+		if (ns->active_ns == ns->ns_fd[INIT_MNTNS])
+			;
+		else
+			/* What do we want to do if switch_ns() fails here?
+			 * Fail? */
+			if (!switch_ns(ns, INIT_MNTNS))
+				goto bad;
+	}
+
 	if (dlopen_handle)
 		dlclose(dlopen_handle);
 
@@ -82,22 +185,28 @@ static void do_reload(void)
 		goto good;
 
 	dlopen_handle = dlopen("/usr/lib/lxcfs/liblxcfs.so", RTLD_LAZY);
-	if (!dlopen_handle) {
-		fprintf(stderr, "Failed to open liblxcfs\n");
-		_exit(1);
-	}
+	if (!dlopen_handle)
+		goto bad;
 
 good:
 	if (need_reload)
 		fprintf(stderr, "lxcfs: reloaded\n");
+	if (ns->active_ns != -1)
+		if (!switch_ns(ns, LXCFS_MNTNS))
+			goto bad;
 	need_reload = 0;
+	return;
+
+bad:
+	fprintf(stderr, "Failed to open liblxcfs\n");
+	_exit(1);
 }
 
 static void up_users(void)
 {
 	users_lock();
 	if (users_count == 0 && need_reload)
-		do_reload();
+		do_reload(&preserved_ns);
 	users_count++;
 	users_unlock();
 }
@@ -114,7 +223,9 @@ static void reload_handler(int sig)
 	need_reload = 1;
 }
 
-/* Functions to run the library methods */
+/*
+ * Functions to run the library methods.
+ */
 static int do_cg_getattr(const char *path, struct stat *sb)
 {
 	int (*cg_getattr)(const char *path, struct stat *sb);
@@ -789,8 +900,8 @@ static bool mkdir_p(const char *dir, mode_t mode)
 
 static bool umount_if_mounted(void)
 {
-	if (umount2(basedir, MNT_DETACH) < 0 && errno != EINVAL) {
-		fprintf(stderr, "failed to umount %s: %s\n", basedir,
+	if (umount2(BASEDIR, MNT_DETACH) < 0 && errno != EINVAL) {
+		fprintf(stderr, "failed to umount %s: %s\n", BASEDIR,
 			strerror(errno));
 		return false;
 	}
@@ -799,7 +910,7 @@ static bool umount_if_mounted(void)
 
 static bool setup_cgfs_dir(void)
 {
-	if (!mkdir_p(basedir, 0700)) {
+	if (!mkdir_p(BASEDIR, 0700)) {
 		fprintf(stderr, "Failed to create lxcfs cgdir\n");
 		return false;
 	}
@@ -807,7 +918,7 @@ static bool setup_cgfs_dir(void)
 		fprintf(stderr, "Failed to clean up old lxcfs cgdir\n");
 		return false;
 	}
-	if (mount("tmpfs", basedir, "tmpfs", 0, "size=100000,mode=700") < 0) {
+	if (mount("tmpfs", BASEDIR, "tmpfs", 0, "size=100000,mode=700") < 0) {
 		fprintf(stderr, "Failed to mount tmpfs for private controllers\n");
 		return false;
 	}
@@ -820,9 +931,9 @@ static bool do_mount_cgroup(char *controller)
 	size_t len;
 	int ret;
 
-	len = strlen(basedir) + strlen(controller) + 2;
+	len = strlen(BASEDIR) + strlen(controller) + 2;
 	target = alloca(len);
-	ret = snprintf(target, len, "%s/%s", basedir, controller);
+	ret = snprintf(target, len, "%s/%s", BASEDIR, controller);
 	if (ret < 0 || ret >= len)
 		return false;
 	if (mkdir(target, 0755) < 0 && errno != EEXIST)
@@ -832,6 +943,132 @@ static bool do_mount_cgroup(char *controller)
 		return false;
 	}
 	return true;
+}
+
+static int pivot_enter(void) {
+	int oldroot = -1, newroot = -1;
+
+	oldroot = open("/", O_DIRECTORY | O_RDONLY);
+	if (oldroot < 0) {
+		fprintf(stderr, "%s: Failed to open old root for fchdir.\n", __func__);
+		return -1;
+	}
+
+	newroot = open(ROOTDIR, O_DIRECTORY | O_RDONLY);
+	if (newroot < 0) {
+		fprintf(stderr, "%s: Failed to open new root for fchdir.\n", __func__);
+		goto err;
+	}
+
+	/* change into new root fs */
+	if (fchdir(newroot)) {
+		fprintf(stderr, "%s: Failed to change directory to new rootfs: %s.\n", __func__, ROOTDIR);
+		goto err;
+	}
+
+	/* pivot_root into our new root fs */
+	if (pivot_root(".", ".")) {
+		fprintf(stderr, "%s: pivot_root() syscall failed: %s.\n", __func__, strerror(errno));
+		goto err;
+	}
+
+	/*
+	 * At this point the old-root is mounted on top of our new-root.
+	 * To unmounted it we must not be chdir'd into it, so escape back
+	 * to the old-root.
+	 */
+	if (fchdir(oldroot) < 0) {
+		fprintf(stderr, "%s: Failed to enter old root.\n", __func__);
+		goto err;
+	}
+	if (umount2(".", MNT_DETACH) < 0) {
+		fprintf(stderr, "%s: Failed to detach old root.\n", __func__);
+		goto err;
+	}
+
+	if (fchdir(newroot) < 0) {
+		fprintf(stderr, "%s: Failed to re-enter new root.\n", __func__);
+		goto err;
+	}
+
+	close(oldroot);
+	close(newroot);
+	return 0;
+
+err:
+	if (oldroot != -1)
+		close(oldroot);
+	if (newroot != -1)
+		close(newroot);
+	return -1;
+}
+
+/*
+ * Prepare our new root: We need to mount everything that fuse needs to
+ * correctly work in our minimal chroot:
+ *	- /var/lib/lxcfs		<-- the fuse mount
+ *	- /dev				<-- because of /dev/fuse
+ * 	- /sys				<-- because we want to mount /sys/fs/connections/fuse
+ * 	- /sys/fs/connections/fuse	<-- because of fuse
+ * 	- /proc				<-- where we read info from
+ * (Is that all we need? Did we not pin any unnecessary mounts?)
+ */
+static int pivot_prepare(void)
+{
+	if (mkdir(ROOTDIR, 0755) < 0 && errno != EEXIST) {
+		fprintf(stderr, "%s: Failed to create directory for new root.\n", __func__);
+		return -1;
+	}
+
+	if (mount("/", ROOTDIR, NULL, MS_BIND, 0) < 0) {
+		fprintf(stderr, "%s: Failed to bind-mount / for new root: %s.\n", __func__, strerror(errno));
+		return -1;
+	}
+
+	if (mount("/proc", ROOTDIR "/proc", NULL, MS_REC|MS_MOVE, 0) < 0) {
+		fprintf(stderr, "%s: Failed to move /proc into new root: %s.\n", __func__, strerror(errno));
+		return -1;
+	}
+
+	if (mount(RUNTIME_PATH, ROOTDIR RUNTIME_PATH, NULL, MS_BIND, 0) < 0) {
+		fprintf(stderr, "%s: Failed to bind-mount /run into new root: %s.\n", __func__, strerror(errno));
+		return -1;
+	}
+
+	if (mount("/dev", ROOTDIR "/dev", NULL, MS_BIND, 0) < 0) {
+		printf("%s: Failed to bind-mount /dev into new root: %s.\n", __func__, strerror(errno));
+		return -1;
+	}
+
+	if (mount("/sys", ROOTDIR "/sys", NULL, MS_BIND, 0) < 0) {
+		printf("%s: failed to bind-mount /sys into new root: %s.\n", __func__, strerror(errno));
+		return -1;
+	}
+
+	if (mount("/sys/fs/fuse/connections", ROOTDIR "/sys/fs/fuse/connections", NULL, MS_BIND, 0) < 0) {
+		printf("%s: failed to bind-mount /sys/fs/fuse/connections into new root: %s.\n", __func__, strerror(errno));
+		return -1;
+	}
+
+	if (mount(BASEDIR, ROOTDIR BASEDIR, NULL, MS_REC|MS_MOVE, 0) < 0) {
+		printf("%s: failed to move " BASEDIR " into new root: %s.\n", __func__, strerror(errno));
+		return -1;
+	}
+
+	return 0;
+}
+
+static int pivot_new_root(void)
+{
+	/* Prepare new root. */
+	if (pivot_prepare() < 0)
+		return -1;
+
+	/* Pivot into new root. */
+	if (pivot_enter() < 0)
+		return -1;
+
+	return 0;
 }
 
 static bool do_mount_cgroups(void)
@@ -870,6 +1107,10 @@ static bool do_mount_cgroups(void)
 		if (!do_mount_cgroup(p))
 			goto out;
 	}
+
+	if (pivot_new_root() < 0)
+		goto out;
+
 	ret = true;
 
 out:
@@ -934,6 +1175,126 @@ static int set_pidfile(char *pidfile)
 	return fd;
 }
 
+static struct fuse *fuse_prepare(int argc, char *argv[],
+				 const struct fuse_operations *op,
+				 size_t op_size, char **mountpoint,
+				 int *multithreaded, void *user_data)
+{
+	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+	struct fuse_chan *ch;
+	struct fuse *fuse = NULL;
+	int foreground;
+	int res;
+
+	res = fuse_parse_cmdline(&args, mountpoint, multithreaded, &foreground);
+	if (res == -1)
+		return NULL;
+
+	ch = fuse_mount(*mountpoint, &args);
+	if (!ch) {
+		fuse_opt_free_args(&args);
+		goto err_free;
+	}
+
+	/* Switch to new mount namespace for lxcfs and setup private mounts for
+	 * fuse.
+	 */
+	if (unshare(CLONE_NEWNS) < 0) {
+		fprintf(stderr, "%s: Failed to unshare the mount namespace: %s.\n", __func__, strerror(errno));
+		goto err_free;
+	}
+
+	if (mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, 0) < 0) {
+		fprintf(stderr, "%s: Failed to re-mount / private: %s.\n", __func__, strerror(errno));
+		goto err_free;
+	}
+
+	/* Preserve lxcfs private mount namespace so we can switch to it when we
+	 * need to.
+	 */
+	if (!preserve_ns(&preserved_ns, LXCFS_MNTNS, getpid(), true))
+		goto err_unmount;
+
+	if (!cgfs_setup_controllers())
+		goto err_unmount;
+
+	fuse = fuse_new(ch, &args, op, op_size, user_data);
+	fuse_opt_free_args(&args);
+	if (fuse == NULL)
+		goto err_unmount;
+
+	res = fuse_daemonize(foreground);
+	if (res == -1)
+		goto err_unmount;
+
+	res = fuse_set_signal_handlers(fuse_get_session(fuse));
+	if (res == -1)
+		goto err_unmount;
+
+	return fuse;
+
+err_unmount:
+	/* fuse_umount() should be done in the initial mount namespace because
+	 * we did our fuse_mount() there. So attach back to host ns here. We do
+	 * not check for error since we can't do anything anyway if it fails.
+	 * TODO: What should we do if we fail? (Probably nothing.(?))
+	 */
+	(void)switch_ns(&preserved_ns, INIT_MNTNS);
+
+	fuse_unmount(*mountpoint, ch);
+	if (fuse)
+		fuse_destroy(fuse);
+err_free:
+	free(*mountpoint);
+	return NULL;
+}
+
+int fuse_init(int argc, char *argv[], const struct fuse_operations *op,
+	      size_t op_size, void *user_data)
+{
+	struct fuse *fuse;
+	char *mountpoint;
+	int multithreaded;
+	int res;
+
+	/* We are in our private mount namespace here! */
+	fuse = fuse_prepare(argc, argv, op, op_size, &mountpoint,
+			    &multithreaded, user_data);
+	if (fuse == NULL)
+		return -1;
+
+	if (multithreaded)
+		res = fuse_loop_mt(fuse);
+	else
+		res = fuse_loop(fuse);
+
+	/* fuse_teardown() should be done in the initial mount namespace because
+	 * we did fuse_new() + fuse_mount() there. So attach back to the initial
+	 * mount namespace here. We do not check for error since we can't do
+	 * anything anyway if it fails.
+	 */
+	(void)switch_ns(&preserved_ns, INIT_MNTNS);
+
+	fuse_teardown(fuse, mountpoint);
+	if (res == -1)
+		return -1;
+
+	return 0;
+}
+
+/* Note that lxcfs creates a private mount namespace (actually rather a minimal
+ * chroot) to hide its cgroup mounts under BASEDIR/ from other processes that
+ * would get confused by it. However, the fuse mount usually placed under
+ * /var/lib/lxcfs (or whatever the user gives us via argv[1]) needs to be
+ * visible in the initial namespace.
+ * Hence, we place these mounts in different namespaces. This requires some
+ * coordination. fuse_mount() needs to be called in the initial namespace.
+ * Afterwards we can unshare(CLONE_NEWNS), setup the cgroup mounts and create
+ * our minimal chroot. On failure we need to switch back to the initial
+ * mount namespace or fuse_umount() to succeed.
+ * Also, when we are asked to reload our dynamic library, we also need to switch
+ * to the initial mount namespace.
+ */
 int main(int argc, char *argv[])
 {
 	int ret = -1, pidfd;
@@ -967,7 +1328,7 @@ int main(int argc, char *argv[])
 	if (argc != 2 || is_help(argv[1]))
 		usage(argv[0]);
 
-	do_reload();
+	do_reload(&preserved_ns);
 	if (signal(SIGUSR1, reload_handler) == SIG_ERR) {
 		fprintf(stderr, "Error setting USR1 signal handler: %m\n");
 		exit(1);
@@ -980,9 +1341,6 @@ int main(int argc, char *argv[])
 	newargv[cnt++] = argv[1];
 	newargv[cnt++] = NULL;
 
-	if (!cgfs_setup_controllers())
-		goto out;
-
 	if (!pidfile) {
 		pidfile_len = strlen(RUNTIME_PATH) + strlen("/lxcfs.pid") + 1;
 		pidfile = alloca(pidfile_len);
@@ -991,7 +1349,13 @@ int main(int argc, char *argv[])
 	if ((pidfd = set_pidfile(pidfile)) < 0)
 		goto out;
 
-	ret = fuse_main(nargs, newargv, &lxcfs_ops, NULL);
+	/* Preserve initial mount namespace so we can switch to it when we need
+	 * to (For example, when we reload our dynamic library.).
+	 */
+	if (!preserve_ns(&preserved_ns, INIT_MNTNS, getpid(), true))
+		goto out;
+
+	ret = fuse_init(nargs, newargv, &lxcfs_ops, sizeof(lxcfs_ops), NULL);
 
 	dlclose(dlopen_handle);
 	unlink(pidfile);
