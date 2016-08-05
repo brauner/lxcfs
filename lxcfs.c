@@ -988,22 +988,32 @@ static bool do_mount_cgroups(void)
 		char *controller = hierarchies[i];
 		clen = strlen(controller);
 		len = strlen(BASEDIR) + clen + 2;
-		target = alloca(len);
+		target = malloc(len);
+		if (!target)
+			return false;
 		ret = snprintf(target, len, "%s/%s", BASEDIR, controller);
-		if (ret < 0 || ret >= len)
+		if (ret < 0 || ret >= len) {
+			free(target);
 			return false;
-		if (mkdir(target, 0755) < 0 && errno != EEXIST)
+		}
+		if (mkdir(target, 0755) < 0 && errno != EEXIST) {
+			free(target);
 			return false;
+		}
 		if (mount(controller, target, "cgroup", 0, controller) < 0) {
 			fprintf(stderr, "Failed mounting cgroup %s\n", controller);
+			free(target);
 			return false;
 		}
 
 		fd = open(target, O_DIRECTORY);
-		if (fd < 0)
+		if (fd < 0) {
+			free(target);
 			return false;
+		}
 
 		fd_hierarchies[i] = fd;
+		free(target);
 	}
 	return true;
 }
