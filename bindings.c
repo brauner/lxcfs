@@ -4034,7 +4034,9 @@ static void __attribute__((destructor)) free_subsystems(void)
 	int i;
 
 	for (i = 0; i < num_hierarchies; i++)
-		if (hierarchies[i])
+		if (hierarchies[i]) {
 			free(hierarchies[i]);
+			close(fd_hierarchies[i]);
+		}
 	free(hierarchies);
 }
