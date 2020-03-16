@@ -169,8 +169,7 @@ static bool is_child_cgroup(const char *controller, const char *cgroup,
 	if (cfd < 0)
 		return false;
 
-	path = must_make_path(dot_or_empty(cgroup), cgroup, file, NULL);
-
+	path = must_make_path_relative(cgroup, file, NULL);
 	ret = fstatat(cfd, path, &sb, 0);
 	if (ret < 0 || !S_ISDIR(sb.st_mode))
 		return false;
@@ -312,8 +311,8 @@ static struct cgfs_files *cgfs_get_key(const char *controller,
 	if (file && strchr(file, '/'))
 		return NULL;
 
-	path = must_make_path(dot_or_empty(cgroup), cgroup, file ? "/" : "",
-			      file ? file : "", NULL);
+	path = must_make_path_relative(cgroup, file ? "/" : "",
+				       file ? file : "", NULL);
 	ret = fstatat(cfd, path, &sb, 0);
 	if (ret < 0)
 		return NULL;
@@ -648,14 +647,14 @@ static void chown_all_cgroup_files(const char *dirname, uid_t uid, gid_t gid, in
 
 static int cgfs_create(const char *controller, const char *cg, uid_t uid, gid_t gid)
 {
-	char *path;
+	__do_free char *path = NULL;
 	int cfd;
 
 	cfd = get_cgroup_fd_handle_named(controller);
 	if (cfd < 0)
 		return -EINVAL;
 
-	path = must_make_path(dot_or_empty(cg), cg, NULL);
+	path = must_make_path_relative(cg, NULL);
 	if (mkdirat(cfd, path, 0755) < 0)
 		return -errno;
 
@@ -777,7 +776,7 @@ static bool cgfs_remove(const char *controller, const char *cg)
 	if (cfd < 0)
 		return false;
 
-	path = must_make_path(dot_or_empty(cg), cg, NULL);
+	path = must_make_path_relative(cg, NULL);
 	fd = openat(cfd, path, O_DIRECTORY | O_CLOEXEC);
 	if (fd < 0)
 		return false;
@@ -848,7 +847,7 @@ static bool cgfs_chmod_file(const char *controller, const char *file, mode_t mod
 	if (cfd < 0)
 		return false;
 
-	path = must_make_path(dot_or_empty(file), file, NULL);
+	path = must_make_path_relative(file, NULL);
 	if (fchmodat(cfd, path, mode, 0) < 0)
 		return false;
 
@@ -932,12 +931,13 @@ static int chown_tasks_files(const char *dirname, uid_t uid, gid_t gid, int fd)
 {
 	__do_free char *path = NULL;
 
-	path = must_make_path(dirname, "tasks", NULL);
+	path = must_make_path_relative(dirname, "tasks", NULL);
 	if (fchownat(fd, path, uid, gid, 0) != 0)
 		return -errno;
 
 	free_disarm(path);
-	path = must_make_path(dirname, "cgroup.procs", NULL);
+
+	path = must_make_path_relative(dirname, "cgroup.procs", NULL);
 	if (fchownat(fd, path, uid, gid, 0) != 0)
 		return -errno;
 
@@ -953,7 +953,7 @@ static int cgfs_chown_file(const char *controller, const char *file, uid_t uid, 
 	if (cfd < 0)
 		return false;
 
-	path = must_make_path(dot_or_empty(file), file, NULL);
+	path = must_make_path_relative(file, NULL);
 
 	if (fchownat(cfd, path, uid, gid, 0) < 0)
 		return -errno;
@@ -1432,8 +1432,7 @@ static FILE *open_pids_file(const char *controller, const char *cgroup)
 	if (cfd < 0)
 		return false;
 
-	path = must_make_path(dot_or_empty(cgroup), cgroup, "cgroup.procs", NULL);
-
+	path = must_make_path_relative(cgroup, "cgroup.procs", NULL);
 	fd = openat(cfd, path, O_WRONLY | O_CLOEXEC);
 	if (fd < 0)
 		return NULL;
@@ -1704,7 +1703,7 @@ static bool cgfs_set_value(const char *controller, const char *cgroup,
 	if (cfd < 0)
 		return false;
 
-	path = must_make_path(dot_or_empty(cgroup), cgroup, file, NULL);
+	path = must_make_path_relative(cgroup, file, NULL);
 	fd = openat(cfd, path, O_WRONLY | O_CLOEXEC);
 	if (fd < 0)
 		return false;
@@ -1778,7 +1777,7 @@ static bool cgfs_iterate_cgroup(const char *controller, const char *cgroup,
 	if (cfd < 0)
 		return false;
 
-	cg_path = must_make_path(dot_or_empty(cgroup), cgroup, NULL);
+	cg_path = must_make_path_relative(cgroup, NULL);
 
 	fd = openat(cfd, cg_path, O_DIRECTORY | O_CLOEXEC);
 	if (fd < 0)
