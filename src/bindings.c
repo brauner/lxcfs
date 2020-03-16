@@ -333,28 +333,6 @@ static int send_creds_clone_wrapper(void *arg)
 	return send_creds(sock, &cred, v, true) != SEND_CREDS_OK;
 }
 
-/*
- * Let's use the "standard stack limit" (i.e. glibc thread size default) for
- * stack sizes: 8MB.
- */
-#define __LXCFS_STACK_SIZE (8 * 1024 * 1024)
-static pid_t lxcfs_clone(int (*fn)(void *), void *arg, int flags)
-{
-	pid_t ret;
-	void *stack;
-
-	stack = malloc(__LXCFS_STACK_SIZE);
-	if (!stack)
-		return ret_errno(ENOMEM);
-
-#ifdef __ia64__
-	ret = __clone2(fn, stack, __LXCFS_STACK_SIZE, flags | SIGCHLD, arg, NULL);
-#else
-	ret = clone(fn, stack + __LXCFS_STACK_SIZE, flags | SIGCHLD, arg, NULL);
-#endif
-	return ret;
-}
-
 #define LXCFS_PROC_PID_NS_LEN                                    \
 	(STRLITERALLEN("/proc/") + INTTYPE_TO_STRLEN(uint64_t) + \
 	 STRLITERALLEN("/ns/pid") + 1)

@@ -411,17 +411,6 @@ again:
 	return 0;
 }
 
-static ssize_t read_nointr(int fd, void *buf, size_t count)
-{
-	ssize_t ret;
-again:
-	ret = read(fd, buf, count);
-	if (ret < 0 && errno == EINTR)
-		goto again;
-
-	return ret;
-}
-
 static void *must_realloc(void *orig, size_t sz)
 {
 	void *ret;
@@ -508,4 +497,48 @@ FILE *fdopen_cached(int fd, const char *mode, void **caller_freed_buffer)
 
 	*caller_freed_buffer = move_ptr(buf);
 	return f;
+}
+
+ssize_t read_nointr(int fd, void *buf, size_t count)
+{
+	ssize_t ret;
+
+	do {
+		ret = read(fd, buf, count);
+	} while (ret < 0 && errno == EINTR);
+
+	return ret;
+}
+
+ssize_t write_nointr(int fd, const void *buf, size_t count)
+{
+	ssize_t ret;
+
+	do {
+		ret = write(fd, buf, count);
+	} while (ret < 0 && errno == EINTR);
+
+	return ret;
+}
+
+/*
+ * Let's use the "standard stack limit" (i.e. glibc thread size default) for
+ * stack sizes: 8MB.
+ */
+#define __LXCFS_STACK_SIZE (8 * 1024 * 1024)
+pid_t lxcfs_clone(int (*fn)(void *), void *arg, int flags)
+{
+	pid_t ret;
+	void *stack;
+
+	stack = malloc(__LXCFS_STACK_SIZE);
+	if (!stack)
+		return ret_errno(ENOMEM);
+
+#ifdef __ia64__
+	ret = __clone2(fn, stack, __LXCFS_STACK_SIZE, flags | SIGCHLD, arg, NULL);
+#else
+	ret = clone(fn, stack + __LXCFS_STACK_SIZE, flags | SIGCHLD, arg, NULL);
+#endif
+	return ret;
 }
